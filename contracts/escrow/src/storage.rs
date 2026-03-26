@@ -1,5 +1,9 @@
 use soroban_sdk::{contracttype, Address, Env, String};
 
+/// Unique identifier for an escrow.
+/// Prepared for future multi-escrow support.
+pub type EscrowId = u64;
+
 /// All possible states an escrow can be in.
 #[contracttype]
 #[derive(Clone, PartialEq, Debug)]
@@ -28,20 +32,23 @@ pub struct EscrowData {
 /// Storage key for the escrow record.
 #[contracttype]
 pub enum DataKey {
-    Escrow,
+    Escrow(EscrowId),
 }
 
+/// Default escrow ID for single-escrow mode.
+const DEFAULT_ESCROW_ID: EscrowId = 0;
+
 pub fn save_escrow(env: &Env, data: &EscrowData) {
-    env.storage().instance().set(&DataKey::Escrow, data);
+    env.storage().instance().set(&DataKey::Escrow(DEFAULT_ESCROW_ID), data);
 }
 
 pub fn load_escrow(env: &Env) -> EscrowData {
     env.storage()
         .instance()
-        .get(&DataKey::Escrow)
+        .get(&DataKey::Escrow(DEFAULT_ESCROW_ID))
         .expect("escrow not initialised")
 }
 
 pub fn has_escrow(env: &Env) -> bool {
-    env.storage().instance().has(&DataKey::Escrow)
+    env.storage().instance().has(&DataKey::Escrow(DEFAULT_ESCROW_ID))
 }
