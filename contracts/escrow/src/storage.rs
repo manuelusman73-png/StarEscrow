@@ -66,9 +66,21 @@ pub enum AllowListKey {
     Tokens,
 }
 
+/// Protocol-level configuration (admin, pause state, fee).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ProtocolConfig {
+    pub admin: Address,
+    pub paused: bool,
+    pub fee_bps: u32,
+    pub fee_collector: Address,
+}
+
+/// Storage key for the escrow record.
 #[contracttype]
 pub enum DataKey {
     Escrow(EscrowId),
+    Config,
 }
 
 const DEFAULT_ESCROW_ID: EscrowId = 0;
@@ -173,4 +185,19 @@ pub fn remove_from_allowlist(env: &Env, token: Address) -> bool {
     } else {
         false
     }
+}
+
+pub fn save_config(env: &Env, config: &ProtocolConfig) {
+    env.storage().instance().set(&DataKey::Config, config);
+}
+
+pub fn load_config(env: &Env) -> ProtocolConfig {
+    env.storage()
+        .instance()
+        .get(&DataKey::Config)
+        .expect("protocol not initialised")
+}
+
+pub fn has_config(env: &Env) -> bool {
+    env.storage().instance().has(&DataKey::Config)
 }
