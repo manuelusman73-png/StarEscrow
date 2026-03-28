@@ -36,6 +36,9 @@ pub struct EscrowData {
     pub yield_protocol: Option<Address>,
     pub principal_deposited: i128,
     pub yield_recipient: YieldRecipient,
+    pub approvers: Vec<Address>,
+    pub required_approvals: u32,
+    pub approval_count: u32,
 }
 
 #[contracttype]
@@ -81,6 +84,7 @@ pub struct ProtocolConfig {
 pub enum DataKey {
     Escrow(EscrowId),
     Config,
+    Approval(EscrowId, Address),
 }
 
 const DEFAULT_ESCROW_ID: EscrowId = 0;
@@ -200,4 +204,16 @@ pub fn load_config(env: &Env) -> ProtocolConfig {
 
 pub fn has_config(env: &Env) -> bool {
     env.storage().instance().has(&DataKey::Config)
+}
+
+pub fn has_approved(env: &Env, approver: &Address) -> bool {
+    env.storage()
+        .instance()
+        .has(&DataKey::Approval(DEFAULT_ESCROW_ID, approver.clone()))
+}
+
+pub fn record_approval(env: &Env, approver: &Address) {
+    env.storage()
+        .instance()
+        .set(&DataKey::Approval(DEFAULT_ESCROW_ID, approver.clone()), &true);
 }

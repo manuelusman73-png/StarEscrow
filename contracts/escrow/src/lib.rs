@@ -6,13 +6,11 @@ mod storage;
 mod r#yield;
 
 pub use errors::EscrowError;
-pub use storage::{EscrowData, EscrowStatus, ProtocolConfig};
+pub use storage::{EscrowData, EscrowStatus, ProtocolConfig, YieldRecipient};
 
-use crate::errors::EscrowError;
 use crate::r#yield::YieldProtocolClient;
-use crate::storage::RateLimitConfig;
 
-use soroban_sdk::{contract, contractimpl, token, Address, Env, String, Symbol};
+use soroban_sdk::{contract, contractimpl, token, Address, Env, String, Vec};
 
 #[contract]
 pub struct EscrowContract;
@@ -60,9 +58,8 @@ impl EscrowContract {
     }
 
     /// Create escrow: payer locks `amount` of `token` for `freelancer`.
-    /// Optional `deadline` is a ledger timestamp after which payer can reclaim funds.
-    /// Optional `yield_protocol` deposits locked funds for yield.
-    /// `yield_recipient` receives accrued yield on withdraw.
+    /// `approvers` is the list of addresses that can approve (empty = payer only).
+    /// `required_approvals` is the threshold (0 = all approvers must sign).
     pub fn create(
         env: Env,
         payer: Address,
@@ -73,6 +70,8 @@ impl EscrowContract {
         deadline: Option<u64>,
         yield_protocol: Option<Address>,
         yield_recipient: YieldRecipient,
+        approvers: Vec<Address>,
+        required_approvals: u32,
     ) -> Result<(), EscrowError> {
         Self::assert_not_paused(&env)?;
         if storage::has_escrow(&env) {
@@ -81,6 +80,18 @@ impl EscrowContract {
         if amount <= 0 {
             return Err(EscrowError::InvalidAmount);
         }
+
+        // Validate threshold
+        let m = approvers.len() as u32;
+        let threshold = if approvers.is_empty() {
+            // Single-payer mode: payer is the sole approver
+            1u32
+        } else {
+            if required_approvals == 0 || required_approvals > m {
+                return Err(EscrowError::InvalidThreshold);
+            }
+            required_approvals
+        };
 
         let allowed = storage::read_allowed_tokens(&env);
         if !allowed.is_empty() && !allowed.contains(&token) {
@@ -103,13 +114,16 @@ impl EscrowContract {
             yield_protocol,
             principal_deposited: 0i128,
             yield_recipient,
+            approvers,
+            required_approvals: threshold,
+            approval_count: 0,
         };
 
         // Deposit to yield protocol if enabled
-        if let Some(protocol) = data.yield_protocol {
-            let yield_client = YieldProtocolClient::new(&env, &protocol);
+        if let Some(ref protocol) = data.yield_protocol {
+            let yield_client = YieldProtocolClient::new(&env, protocol);
             yield_client.deposit(&amount);
-            events::yield_deposited(&env, &protocol, amount);
+            events::yield_deposited(&env, protocol, amount);
             data.principal_deposited = amount;
         }
 
@@ -125,36 +139,50 @@ impl EscrowContract {
         if data.status != EscrowStatus::Active {
             return Err(EscrowError::NotActive);
         }
+        data.freelancer.require_auth();
+        data.status = EscrowStatus::WorkSubmitted;
+        storage::save_escrow(&env, &data);
+        events::work_submitted(&env, &data.freelancer);
+        Ok(())
     }
 
-    /// Payer approves milestone — releases funds to freelancer (minus protocol fee).
-    pub fn approve(env: Env) -> Result<(), EscrowError> {
+    /// Record an approval from `approver`. In multisig mode `approver` must be in the
+    /// approvers list. In single-payer mode (empty approvers) only the payer can approve.
+    /// Funds are released automatically when the threshold is reached.
+    pub fn approve(env: Env, approver: Address) -> Result<(), EscrowError> {
         Self::assert_not_paused(&env)?;
         let mut data = storage::load_escrow(&env);
         if data.status != EscrowStatus::WorkSubmitted {
             return Err(EscrowError::WorkNotSubmitted);
         }
-        data.payer.require_auth();
 
-        let client = token::Client::new(&env, &data.token);
-
-        // Apply protocol fee if configured
-        let (freelancer_amount, fee_amount) = if storage::has_config(&env) {
-            let config = storage::load_config(&env);
-            let fee = data.amount * (config.fee_bps as i128) / 10000;
-            if fee > 0 {
-                client.transfer(&env.current_contract_address(), &config.fee_collector, &fee);
+        // Validate approver is authorised
+        if data.approvers.is_empty() {
+            // Single-payer mode: only payer can approve
+            if approver != data.payer {
+                return Err(EscrowError::Unauthorized);
             }
-            (data.amount - fee, fee)
         } else {
-            (data.amount, 0)
-        };
+            if !data.approvers.contains(&approver) {
+                return Err(EscrowError::Unauthorized);
+            }
+        }
+        approver.require_auth();
 
-        client.transfer(&env.current_contract_address(), &data.freelancer, &freelancer_amount);
-        events::payment_released(&env, &data.freelancer, freelancer_amount);
-        let _ = fee_amount; // used above
-        data.status = EscrowStatus::Completed;
-        storage::save_escrow(&env, &data);
+        if storage::has_approved(&env, &approver) {
+            return Err(EscrowError::AlreadyApproved);
+        }
+        storage::record_approval(&env, &approver);
+        data.approval_count += 1;
+
+        events::approval_recorded(&env, &approver, data.approval_count, data.required_approvals);
+
+        if data.approval_count >= data.required_approvals {
+            Self::release_funds(&env, &mut data)?;
+        } else {
+            storage::save_escrow(&env, &data);
+        }
+
         Ok(())
     }
 
@@ -230,6 +258,46 @@ impl EscrowContract {
         if storage::has_config(env) && storage::load_config(env).paused {
             return Err(EscrowError::Paused);
         }
+        Ok(())
+    }
+
+    fn release_funds(env: &Env, data: &mut EscrowData) -> Result<(), EscrowError> {
+        let client = token::Client::new(env, &data.token);
+
+        let (freelancer_amount, fee_amount) = if storage::has_config(env) {
+            let config = storage::load_config(env);
+            let fee = data.amount * (config.fee_bps as i128) / 10000;
+            if fee > 0 {
+                client.transfer(&env.current_contract_address(), &config.fee_collector, &fee);
+            }
+            (data.amount - fee, fee)
+        } else {
+            (data.amount, 0)
+        };
+
+        client.transfer(&env.current_contract_address(), &data.freelancer, &freelancer_amount);
+        events::payment_released(env, &data.freelancer, freelancer_amount);
+        let _ = fee_amount;
+        data.status = EscrowStatus::Completed;
+        storage::save_escrow(env, data);
+        Ok(())
+    }
+
+    fn withdraw_funds(
+        env: &Env,
+        data: &mut EscrowData,
+        recipient: Address,
+    ) -> Result<(), EscrowError> {
+        let mut total = data.amount;
+
+        if let Some(ref protocol) = data.yield_protocol {
+            let yield_client = YieldProtocolClient::new(env, protocol);
+            let (principal, yield_accrued) = yield_client.withdraw(&data.principal_deposited);
+            total = principal + yield_accrued;
+        }
+
+        let client = token::Client::new(env, &data.token);
+        client.transfer(&env.current_contract_address(), &recipient, &total);
         Ok(())
     }
 }
