@@ -33,11 +33,31 @@ Then open a Pull Request against `main`.
 
 ## Code Style
 
+This project uses [`rustfmt.toml`](../rustfmt.toml) for consistent formatting. The configuration is automatically picked up by `cargo fmt`.
+
 Run these before pushing — CI will enforce both:
 
 ```bash
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings
+```
+
+### Formatting Configuration
+
+The [`rustfmt.toml`](../rustfmt.toml) file at the repository root defines the project's formatting standards, including:
+- Edition 2021
+- 100-character line width
+- Module-level import granularity
+- Consistent trailing commas
+
+To format your code:
+```bash
+cargo fmt --all
+```
+
+To check formatting without making changes:
+```bash
+cargo fmt --all -- --check
 ```
 
 ## PR Checklist
