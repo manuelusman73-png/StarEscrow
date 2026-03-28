@@ -125,6 +125,14 @@ enum Commands {
     /// Interactive setup wizard: configure network, generate keypairs, fund via friendbot,
     /// write .env, and deploy the contract.
     Setup,
+    /// Export escrow data to a JSON file for record-keeping or auditing.
+    Export {
+        #[arg(long, env = "ESCROW_CONTRACT_ID")]
+        contract_id: String,
+        /// Path to write the JSON output (default: escrow.json)
+        #[arg(long, default_value = "escrow.json")]
+        output: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -201,6 +209,9 @@ fn main() -> Result<()> {
         }
         Commands::Setup => {
             run_setup_wizard()?;
+        }
+        Commands::Export { contract_id, output: out_path } => {
+            run_export(&cli.rpc_url, &cli.network_passphrase, &contract_id, &out_path)?;
         }
     }
 
@@ -305,6 +316,34 @@ fn run_setup_wizard() -> Result<()> {
     println!("\n.env written. Review and update FREELANCER_SECRET before use.\n");
     println!("Setup complete!");
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Export
+// ---------------------------------------------------------------------------
+
+fn run_export(rpc_url: &str, network_passphrase: &str, contract_id: &str, out_path: &str) -> Result<()> {
+    let raw = query_contract(rpc_url, network_passphrase, contract_id, "get_escrow")?;
+
+    if raw.trim().is_empty() {
+        anyhow::bail!("No escrow data found for contract {contract_id}");
+    }
+
+    let escrow: Value = serde_json::from_str(raw.trim())
+        .unwrap_or(Value::String(raw.trim().to_string()));
+
+    let doc = json!({
+        "contract_id": contract_id,
+        "network": network_passphrase,
+        "rpc_url": rpc_url,
+        "escrow": escrow,
+    });
+
+    std::fs::write(out_path, serde_json::to_string_pretty(&doc)?)
+        .with_context(|| format!("Failed to write {out_path}"))?;
+
+    println!("Escrow data written to {out_path}");
     Ok(())
 }
 
