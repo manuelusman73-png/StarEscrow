@@ -60,13 +60,6 @@ pub fn contract_unpaused(env: &Env, admin: &Address) {
     );
 }
 
-pub fn approval_recorded(env: &Env, approver: &Address, count: u32, required: u32) {
-    env.events().publish(
-        (Symbol::new(env, "approval_recorded"),),
-        (approver.clone(), count, required),
-    );
-}
-
 pub fn yield_deposited(env: &Env, protocol: &Address, amount: i128) {
     env.events().publish(
         (Symbol::new(env, "yield_deposited"),),

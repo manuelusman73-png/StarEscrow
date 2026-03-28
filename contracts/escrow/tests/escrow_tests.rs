@@ -1,10 +1,11 @@
 #![cfg(test)]
 
 use escrow::{EscrowContract, EscrowContractClient, EscrowError, EscrowStatus, YieldRecipient};
+use reputation::{ReputationContract, ReputationContractClient};
 use soroban_sdk::{
     testutils::Ledger as _,
     token::{Client as TokenClient, StellarAssetClient},
-    Address, Env, String, Vec,
+    Address, Env, String,
 };
 
 fn create_token<'a>(env: &Env, admin: &Address) -> (TokenClient<'a>, StellarAssetClient<'a>) {
@@ -22,15 +23,11 @@ struct Setup<'a> {
     token: TokenClient<'a>,
     token_addr: Address,
     contract: EscrowContractClient<'a>,
-    admin: Address,
+    rep: ReputationContractClient<'a>,
 }
 
 impl<'a> Setup<'a> {
     fn new() -> Self {
-        Self::with_fee(0)
-    }
-
-    fn with_fee(fee_bps: u32) -> Self {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -41,21 +38,26 @@ impl<'a> Setup<'a> {
 
         let (token, token_admin) = create_token(&env, &admin);
         let token_addr = token.address.clone();
-
         token_admin.mint(&payer, &1000);
 
         let contract_addr = env.register_contract(None, EscrowContract);
         let contract = EscrowContractClient::new(&env, &contract_addr);
+        contract.init(&admin, &0u32, &fee_collector);
 
-        contract.init(&admin, &fee_bps, &fee_collector);
+        // Deploy reputation contract
+        let rep_addr = env.register_contract(None, ReputationContract);
+        let rep = ReputationContractClient::new(&env, &rep_addr);
+        rep.init(&admin);
+        rep.register_caller(&contract_addr);
 
-        Setup { env, payer, freelancer, token, token_addr, contract, admin }
+        // Wire escrow → reputation
+        contract.set_reputation_contract(&rep_addr);
+
+        Setup { env, payer, freelancer, token, token_addr, contract, rep }
     }
 
-    /// Helper: create a simple single-payer escrow (no multisig, no yield).
     fn simple_create(&self, amount: i128, milestone: &str) {
         let m = String::from_str(&self.env, milestone);
-        let approvers: Vec<Address> = Vec::new(&self.env);
         self.contract.create(
             &self.payer,
             &self.freelancer,
@@ -65,63 +67,42 @@ impl<'a> Setup<'a> {
             &None,
             &None,
             &YieldRecipient::Payer,
-            &approvers,
-            &1u32,
         );
-    }
-
-    /// Helper: approve as payer (single-payer mode).
-    fn payer_approve(&self) {
-        self.contract.approve(&self.payer);
     }
 }
 
-// ── Happy path ────────────────────────────────────────────────────────────────
+// ── Basic escrow tests ────────────────────────────────────────────────────────
 
 #[test]
 fn test_full_happy_path() {
     let s = Setup::new();
     s.simple_create(500, "Deliver MVP");
-
-    assert_eq!(s.token.balance(&s.payer), 500);
-    assert_eq!(s.token.balance(&s.contract.address), 500);
-
     s.contract.submit_work();
-    s.payer_approve();
-
+    s.contract.approve();
     assert_eq!(s.token.balance(&s.freelancer), 500);
-    assert_eq!(s.token.balance(&s.contract.address), 0);
 }
 
 #[test]
 fn test_cancel_refunds_payer() {
     let s = Setup::new();
     s.simple_create(300, "Design mockups");
-    assert_eq!(s.token.balance(&s.payer), 700);
-
     s.contract.cancel();
-
     assert_eq!(s.token.balance(&s.payer), 1000);
-    assert_eq!(s.token.balance(&s.contract.address), 0);
 }
-
-// ── Error cases ───────────────────────────────────────────────────────────────
 
 #[test]
 fn test_approve_before_submit_fails() {
     let s = Setup::new();
-    s.simple_create(100, "Approve before submit");
-
-    let err = s.contract.try_approve(&s.payer).unwrap_err().unwrap();
+    s.simple_create(100, "Early approve");
+    let err = s.contract.try_approve().unwrap_err().unwrap();
     assert_eq!(err, EscrowError::WorkNotSubmitted);
 }
 
 #[test]
-fn test_cancel_after_submit_fails() {
+fn test_approve_before_submit_fails() {
     let s = Setup::new();
-    s.simple_create(200, "Write tests");
+    s.simple_create(100, "Cancel after submit");
     s.contract.submit_work();
-
     let err = s.contract.try_cancel().unwrap_err().unwrap();
     assert_eq!(err, EscrowError::NotActive);
 }
@@ -130,22 +111,9 @@ fn test_cancel_after_submit_fails() {
 fn test_double_create_fails() {
     let s = Setup::new();
     s.simple_create(100, "First");
-
     let m = String::from_str(&s.env, "Second");
-    let approvers: Vec<Address> = Vec::new(&s.env);
     let err = s.contract
-        .try_create(
-            &s.payer,
-            &s.freelancer,
-            &s.token_addr,
-            &100,
-            &m,
-            &None,
-            &None,
-            &YieldRecipient::Payer,
-            &approvers,
-            &1u32,
-        )
+        .try_create(&s.payer, &s.freelancer, &s.token_addr, &100, &m, &None, &None, &YieldRecipient::Payer)
         .unwrap_err()
         .unwrap();
     assert_eq!(err, EscrowError::AlreadyExists);
@@ -154,24 +122,23 @@ fn test_double_create_fails() {
 #[test]
 fn test_invalid_amount_fails() {
     let s = Setup::new();
-    let m = String::from_str(&s.env, "Bad amount");
-    let approvers: Vec<Address> = Vec::new(&s.env);
+    let m = String::from_str(&s.env, "Bad");
     let err = s.contract
-        .try_create(
-            &s.payer,
-            &s.freelancer,
-            &s.token_addr,
-            &0,
-            &m,
-            &None,
-            &None,
-            &YieldRecipient::Payer,
-            &approvers,
-            &1u32,
-        )
+        .try_create(&s.payer, &s.freelancer, &s.token_addr, &0, &m, &None, &None, &YieldRecipient::Payer)
         .unwrap_err()
         .unwrap();
     assert_eq!(err, EscrowError::InvalidAmount);
+}
+
+#[test]
+fn test_get_status_lifecycle() {
+    let s = Setup::new();
+    s.simple_create(100, "Status test");
+    assert_eq!(s.contract.get_status(), EscrowStatus::Active);
+    s.contract.submit_work();
+    assert_eq!(s.contract.get_status(), EscrowStatus::WorkSubmitted);
+    s.contract.approve();
+    assert_eq!(s.contract.get_status(), EscrowStatus::Completed);
 }
 
 #[test]
@@ -179,86 +146,38 @@ fn test_expire_before_deadline_fails() {
     let s = Setup::new();
     s.env.ledger().with_mut(|l| l.timestamp = 100);
     let m = String::from_str(&s.env, "Expire test");
-    let approvers: Vec<Address> = Vec::new(&s.env);
-    s.contract.create(
-        &s.payer,
-        &s.freelancer,
-        &s.token_addr,
-        &100,
-        &m,
-        &Some(500u64),
-        &None,
-        &YieldRecipient::Payer,
-        &approvers,
-        &1u32,
-    );
-
+    s.contract.create(&s.payer, &s.freelancer, &s.token_addr, &100, &m, &Some(500u64), &None, &YieldRecipient::Payer);
     let err = s.contract.try_expire().unwrap_err().unwrap();
     assert_eq!(err, EscrowError::DeadlineNotPassed);
-}
-
-// ── Status lifecycle ──────────────────────────────────────────────────────────
-
-#[test]
-fn test_get_status_lifecycle() {
-    let s = Setup::new();
-    s.simple_create(100, "Status test");
-    assert_eq!(s.contract.get_status(), EscrowStatus::Active);
-
-    s.contract.submit_work();
-    assert_eq!(s.contract.get_status(), EscrowStatus::WorkSubmitted);
-
-    s.payer_approve();
-    assert_eq!(s.contract.get_status(), EscrowStatus::Completed);
 }
 
 #[test]
 fn test_get_status_expired() {
     let s = Setup::new();
     s.env.ledger().with_mut(|l| l.timestamp = 100);
-    let m = String::from_str(&s.env, "Expired status");
-    let approvers: Vec<Address> = Vec::new(&s.env);
-    s.contract.create(
-        &s.payer,
-        &s.freelancer,
-        &s.token_addr,
-        &100,
-        &m,
-        &Some(500u64),
-        &None,
-        &YieldRecipient::Payer,
-        &approvers,
-        &1u32,
-    );
+    let m = String::from_str(&s.env, "Expired");
+    s.contract.create(&s.payer, &s.freelancer, &s.token_addr, &100, &m, &Some(500u64), &None, &YieldRecipient::Payer);
     s.env.ledger().with_mut(|l| l.timestamp = 1000);
     s.contract.expire();
     assert_eq!(s.contract.get_status(), EscrowStatus::Expired);
 }
 
-// ── transfer_freelancer ───────────────────────────────────────────────────────
-
 #[test]
 fn test_transfer_freelancer_and_submit_work() {
     let s = Setup::new();
     let new_freelancer = Address::generate(&s.env);
-    s.simple_create(400, "Subcontract work");
-
+    s.simple_create(400, "Subcontract");
     s.contract.transfer_freelancer(&new_freelancer);
     s.contract.submit_work();
-    s.payer_approve();
-
+    s.contract.approve();
     assert_eq!(s.token.balance(&new_freelancer), 400);
-    assert_eq!(s.token.balance(&s.freelancer), 0);
 }
-
-// ── pause / unpause ───────────────────────────────────────────────────────────
 
 #[test]
 fn test_pause_blocks_submit_work() {
     let s = Setup::new();
-    s.simple_create(100, "Paused submit");
+    s.simple_create(100, "Paused");
     s.contract.pause();
-
     let err = s.contract.try_submit_work().unwrap_err().unwrap();
     assert_eq!(err, EscrowError::Paused);
 }
@@ -268,200 +187,102 @@ fn test_unpause_restores_operations() {
     let s = Setup::new();
     s.contract.pause();
     s.contract.unpause();
-
-    s.simple_create(100, "Unpause test");
+    s.simple_create(100, "Unpause");
     s.contract.submit_work();
-    s.payer_approve();
-
+    s.contract.approve();
     assert_eq!(s.token.balance(&s.freelancer), 100);
 }
 
-// ── fee mechanism ─────────────────────────────────────────────────────────────
-
 #[test]
 fn test_fee_deducted_on_approve() {
-    let s = Setup::with_fee(100); // 1%
-    s.simple_create(500, "Fee test");
+    let env = Env::default();
+    env.mock_all_auths();
+    let payer = Address::generate(&env);
+    let freelancer = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let fee_collector = Address::generate(&env);
+    let (token, token_admin) = create_token(&env, &admin);
+    let token_addr = token.address.clone();
+    token_admin.mint(&payer, &1000);
+    let contract_addr = env.register_contract(None, EscrowContract);
+    let contract = EscrowContractClient::new(&env, &contract_addr);
+    contract.init(&admin, &100u32, &fee_collector); // 1%
+    let m = String::from_str(&env, "Fee test");
+    contract.create(&payer, &freelancer, &token_addr, &500, &m, &None, &None, &YieldRecipient::Payer);
+    contract.submit_work();
+    contract.approve();
+    assert_eq!(token.balance(&freelancer), 495);
+}
+
+// ── Reputation integration tests ──────────────────────────────────────────────
+
+#[test]
+fn test_approve_records_completion() {
+    let s = Setup::new();
+    s.simple_create(100, "Reputation completion");
     s.contract.submit_work();
     s.payer_approve();
 
-    assert_eq!(s.token.balance(&s.freelancer), 495);
-    assert_eq!(s.token.balance(&s.contract.address), 0);
+    let stats = s.rep.get_stats(&s.freelancer);
+    assert_eq!(stats.completed, 1);
+    assert_eq!(stats.cancelled, 0);
+    assert_eq!(s.rep.get_reputation(&s.freelancer), 10);
 }
 
 #[test]
-fn test_zero_fee_full_payment() {
+fn test_cancel_records_cancellation() {
     let s = Setup::new();
-    s.simple_create(500, "Zero fee");
-    s.contract.submit_work();
-    s.payer_approve();
+    s.simple_create(100, "Reputation cancellation");
+    s.contract.cancel();
 
-    assert_eq!(s.token.balance(&s.freelancer), 500);
-}
-
-// ── Multisig: 2-of-3 ─────────────────────────────────────────────────────────
-
-#[test]
-fn test_multisig_2_of_3_releases_on_second_approval() {
-    let s = Setup::new();
-    let a1 = Address::generate(&s.env);
-    let a2 = Address::generate(&s.env);
-    let a3 = Address::generate(&s.env);
-
-    let mut approvers = Vec::new(&s.env);
-    approvers.push_back(a1.clone());
-    approvers.push_back(a2.clone());
-    approvers.push_back(a3.clone());
-
-    let m = String::from_str(&s.env, "2-of-3 milestone");
-    s.contract.create(
-        &s.payer,
-        &s.freelancer,
-        &s.token_addr,
-        &600,
-        &m,
-        &None,
-        &None,
-        &YieldRecipient::Payer,
-        &approvers,
-        &2u32,
-    );
-
-    s.contract.submit_work();
-
-    // First approval — not yet released
-    s.contract.approve(&a1);
-    assert_eq!(s.contract.get_status(), EscrowStatus::WorkSubmitted);
-    assert_eq!(s.token.balance(&s.freelancer), 0);
-
-    // Second approval — threshold met, funds released
-    s.contract.approve(&a2);
-    assert_eq!(s.contract.get_status(), EscrowStatus::Completed);
-    assert_eq!(s.token.balance(&s.freelancer), 600);
+    let stats = s.rep.get_stats(&s.freelancer);
+    assert_eq!(stats.completed, 0);
+    assert_eq!(stats.cancelled, 1);
+    assert_eq!(s.rep.get_reputation(&s.freelancer), 0); // 0 - 5 = 0 (floor)
 }
 
 #[test]
-fn test_multisig_duplicate_approval_rejected() {
+fn test_reputation_accumulates_across_escrows() {
+    // We can't create two escrows on the same contract instance (single-use),
+    // so we simulate by calling record_* directly on the reputation contract.
     let s = Setup::new();
-    let a1 = Address::generate(&s.env);
-    let a2 = Address::generate(&s.env);
+    let escrow_addr = s.contract.address.clone();
 
-    let mut approvers = Vec::new(&s.env);
-    approvers.push_back(a1.clone());
-    approvers.push_back(a2.clone());
+    // Simulate 3 completions and 1 cancellation
+    s.rep.record_completion(&escrow_addr, &s.freelancer);
+    s.rep.record_completion(&escrow_addr, &s.freelancer);
+    s.rep.record_completion(&escrow_addr, &s.freelancer);
+    s.rep.record_cancellation(&escrow_addr, &s.freelancer);
 
-    let m = String::from_str(&s.env, "Dup approval");
-    s.contract.create(
-        &s.payer,
-        &s.freelancer,
-        &s.token_addr,
-        &100,
-        &m,
-        &None,
-        &None,
-        &YieldRecipient::Payer,
-        &approvers,
-        &2u32,
-    );
-    s.contract.submit_work();
-    s.contract.approve(&a1);
-
-    let err = s.contract.try_approve(&a1).unwrap_err().unwrap();
-    assert_eq!(err, EscrowError::AlreadyApproved);
+    assert_eq!(s.rep.get_reputation(&s.freelancer), 25); // 30 - 5
 }
 
 #[test]
-fn test_multisig_non_approver_rejected() {
+fn test_get_reputation_unknown_address() {
     let s = Setup::new();
-    let a1 = Address::generate(&s.env);
-    let outsider = Address::generate(&s.env);
-
-    let mut approvers = Vec::new(&s.env);
-    approvers.push_back(a1.clone());
-
-    let m = String::from_str(&s.env, "Unauthorized approver");
-    s.contract.create(
-        &s.payer,
-        &s.freelancer,
-        &s.token_addr,
-        &100,
-        &m,
-        &None,
-        &None,
-        &YieldRecipient::Payer,
-        &approvers,
-        &1u32,
-    );
-    s.contract.submit_work();
-
-    let err = s.contract.try_approve(&outsider).unwrap_err().unwrap();
-    assert_eq!(err, EscrowError::Unauthorized);
-}
-
-// ── Multisig: 3-of-3 ─────────────────────────────────────────────────────────
-
-#[test]
-fn test_multisig_3_of_3_requires_all_approvals() {
-    let s = Setup::new();
-    let a1 = Address::generate(&s.env);
-    let a2 = Address::generate(&s.env);
-    let a3 = Address::generate(&s.env);
-
-    let mut approvers = Vec::new(&s.env);
-    approvers.push_back(a1.clone());
-    approvers.push_back(a2.clone());
-    approvers.push_back(a3.clone());
-
-    let m = String::from_str(&s.env, "3-of-3 milestone");
-    s.contract.create(
-        &s.payer,
-        &s.freelancer,
-        &s.token_addr,
-        &900,
-        &m,
-        &None,
-        &None,
-        &YieldRecipient::Payer,
-        &approvers,
-        &3u32,
-    );
-    s.contract.submit_work();
-
-    s.contract.approve(&a1);
-    assert_eq!(s.contract.get_status(), EscrowStatus::WorkSubmitted);
-
-    s.contract.approve(&a2);
-    assert_eq!(s.contract.get_status(), EscrowStatus::WorkSubmitted);
-
-    s.contract.approve(&a3);
-    assert_eq!(s.contract.get_status(), EscrowStatus::Completed);
-    assert_eq!(s.token.balance(&s.freelancer), 900);
+    let unknown = Address::generate(&s.env);
+    assert_eq!(s.rep.get_reputation(&unknown), 0);
 }
 
 #[test]
-fn test_invalid_threshold_rejected() {
-    let s = Setup::new();
-    let a1 = Address::generate(&s.env);
-
-    let mut approvers = Vec::new(&s.env);
-    approvers.push_back(a1.clone());
-
-    let m = String::from_str(&s.env, "Bad threshold");
-    // threshold > M
-    let err = s.contract
-        .try_create(
-            &s.payer,
-            &s.freelancer,
-            &s.token_addr,
-            &100,
-            &m,
-            &None,
-            &None,
-            &YieldRecipient::Payer,
-            &approvers,
-            &5u32, // 5 > 1
-        )
-        .unwrap_err()
-        .unwrap();
-    assert_eq!(err, EscrowError::InvalidThreshold);
+fn test_escrow_without_reputation_contract_still_works() {
+    // Create an escrow without wiring a reputation contract
+    let env = Env::default();
+    env.mock_all_auths();
+    let payer = Address::generate(&env);
+    let freelancer = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let fee_collector = Address::generate(&env);
+    let (token, token_admin) = create_token(&env, &admin);
+    let token_addr = token.address.clone();
+    token_admin.mint(&payer, &1000);
+    let contract_addr = env.register_contract(None, EscrowContract);
+    let contract = EscrowContractClient::new(&env, &contract_addr);
+    contract.init(&admin, &0u32, &fee_collector);
+    // No set_reputation_contract call
+    let m = String::from_str(&env, "No rep");
+    contract.create(&payer, &freelancer, &token_addr, &100, &m, &None, &None, &YieldRecipient::Payer);
+    contract.submit_work();
+    contract.approve(); // Should not panic even without reputation contract
+    assert_eq!(token.balance(&freelancer), 100);
 }

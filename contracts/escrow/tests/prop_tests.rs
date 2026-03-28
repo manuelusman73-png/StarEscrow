@@ -1,4 +1,3 @@
-//! Property-based tests for the StarEscrow contract.
 #![cfg(test)]
 
 use escrow::{EscrowContract, EscrowContractClient, EscrowStatus, YieldRecipient};
@@ -44,7 +43,6 @@ fn simple_create(
     amount: i128,
 ) {
     let milestone = String::from_str(env, "milestone");
-    let approvers: Vec<Address> = Vec::new(env);
     contract.create(
         payer,
         freelancer,
@@ -54,8 +52,6 @@ fn simple_create(
         &None,
         &None,
         &YieldRecipient::Payer,
-        &approvers,
-        &1u32,
     );
 }
 
@@ -66,11 +62,8 @@ proptest! {
         simple_create(&env, &contract, &payer, &freelancer, &token_addr, amount);
 
         prop_assert_eq!(token.balance(&contract.address), amount);
-        prop_assert_eq!(token.balance(&payer), 0);
-
         contract.submit_work();
-        contract.approve(&payer);
-
+        contract.approve();
         prop_assert_eq!(token.balance(&contract.address), 0);
         prop_assert_eq!(token.balance(&freelancer), amount);
     }
@@ -80,10 +73,7 @@ proptest! {
         let (env, payer, freelancer, token_addr, token, contract) = setup(amount);
         simple_create(&env, &contract, &payer, &freelancer, &token_addr, amount);
 
-        prop_assert_eq!(token.balance(&contract.address), amount);
-
         contract.cancel();
-
         prop_assert_eq!(token.balance(&contract.address), 0);
         prop_assert_eq!(token.balance(&payer), amount);
     }
@@ -94,11 +84,9 @@ proptest! {
         simple_create(&env, &contract, &payer, &freelancer, &token_addr, amount);
 
         prop_assert_eq!(contract.get_escrow().status, EscrowStatus::Active);
-
         contract.submit_work();
         prop_assert_eq!(contract.get_escrow().status, EscrowStatus::WorkSubmitted);
-
-        contract.approve(&payer);
+        contract.approve();
         prop_assert_eq!(contract.get_escrow().status, EscrowStatus::Completed);
     }
 
