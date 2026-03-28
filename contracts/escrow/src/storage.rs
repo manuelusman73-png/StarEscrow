@@ -1,5 +1,17 @@
 use soroban_sdk::{contracttype, Address, Env, String, Vec};
 
+/// Minimum ledgers before TTL extension kicks in (~1 day at 5s/ledger).
+pub const TTL_MIN_LEDGERS: u32 = 17_280;
+/// Maximum ledgers to extend TTL to (~30 days at 5s/ledger).
+pub const TTL_MAX_LEDGERS: u32 = 518_400;
+
+/// Extend the instance storage TTL so escrow data doesn't expire.
+pub fn extend_ttl(env: &Env) {
+    env.storage()
+        .instance()
+        .extend_ttl(TTL_MIN_LEDGERS, TTL_MAX_LEDGERS);
+}
+
 /// Unique identifier for an escrow.
 pub type EscrowId = u64;
 

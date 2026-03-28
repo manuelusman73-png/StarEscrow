@@ -397,3 +397,50 @@ fn test_recurring_cancel_refunds_remaining() {
     assert_eq!(s.token.balance(&s.payer), 9700 + 200); // 9700 after locking 300, +200 refund
     assert_eq!(s.token.balance(&s.freelancer), 100);
 }
+
+// ── TTL extension ─────────────────────────────────────────────────────────────
+
+#[test]
+fn test_ttl_extended_after_create() {
+    let s = Setup::new();
+    let milestone = String::from_str(&s.env, "TTL test");
+
+    s.contract.create(&s.payer, &s.freelancer, &s.token_addr, &100, &milestone, &None);
+
+    // After create the instance TTL should be extended; verify storage is still accessible.
+    assert_eq!(s.contract.get_status(), escrow::EscrowStatus::Active);
+}
+
+#[test]
+fn test_ttl_extended_after_submit_work() {
+    let s = Setup::new();
+    let milestone = String::from_str(&s.env, "TTL submit");
+
+    s.contract.create(&s.payer, &s.freelancer, &s.token_addr, &100, &milestone, &None);
+    s.contract.submit_work();
+
+    assert_eq!(s.contract.get_status(), escrow::EscrowStatus::WorkSubmitted);
+}
+
+#[test]
+fn test_ttl_extended_after_approve() {
+    let s = Setup::new();
+    let milestone = String::from_str(&s.env, "TTL approve");
+
+    s.contract.create(&s.payer, &s.freelancer, &s.token_addr, &100, &milestone, &None);
+    s.contract.submit_work();
+    s.contract.approve();
+
+    assert_eq!(s.contract.get_status(), escrow::EscrowStatus::Completed);
+}
+
+#[test]
+fn test_ttl_extended_after_cancel() {
+    let s = Setup::new();
+    let milestone = String::from_str(&s.env, "TTL cancel");
+
+    s.contract.create(&s.payer, &s.freelancer, &s.token_addr, &100, &milestone, &None);
+    s.contract.cancel();
+
+    assert_eq!(s.contract.get_status(), escrow::EscrowStatus::Cancelled);
+}

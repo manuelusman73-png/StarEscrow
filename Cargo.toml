@@ -15,3 +15,8 @@ debug-assertions = false
 panic = "abort"
 codegen-units = 1
 lto = true
+
+# Separate profile used by `stellar contract build` / wasm-opt pipeline.
+# Identical to release but named explicitly so CI can reference it.
+[profile.contract-release]
+inherits = "release"

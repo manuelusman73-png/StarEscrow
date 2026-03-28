@@ -124,37 +124,20 @@ enum Commands {
         #[arg(long)]
         payer: String,
     },
-    /// Interactive setup wizard: configure network, generate keypairs, fund via friendbot,
-    /// write .env, and deploy the contract.
-    Setup,
-    /// Export escrow data to a JSON file for record-keeping or auditing.
-    Export {
-        #[arg(long, env = "ESCROW_CONTRACT_ID")]
-        contract_id: String,
-        /// Path to write the JSON output (default: escrow.json)
-        #[arg(long, default_value = "escrow.json")]
-        output: String,
-    },
-    /// Print a shell completion script to stdout.
-    ///
-    /// Usage examples:
-    ///   star-escrow completion bash >> ~/.bash_completion
-    ///   star-escrow completion zsh  > ~/.zfunc/_star-escrow
-    ///   star-escrow completion fish > ~/.config/fish/completions/star-escrow.fish
-    Completion {
-        /// Shell to generate completions for: bash, zsh, fish
-        shell: Shell,
-    },
-    /// Simulate a transaction and report the estimated fee.
-    EstimateFee {
-        #[arg(long, env = "ESCROW_CONTRACT_ID")]
-        contract_id: String,
-        /// Operation to simulate: create, submit-work, approve, cancel, expire
+
+    /// Build (optional) and deploy the escrow contract WASM to the network
+    Deploy {
+        /// Path to pre-built WASM file. If omitted, runs `stellar contract build` first.
         #[arg(long)]
-        operation: String,
-        /// Source account secret key (used to simulate the transaction)
-        #[arg(long)]
-        source_secret: String,
+        wasm: Option<std::path::PathBuf>,
+
+        /// Deployer secret key (pays the deployment fee)
+        #[arg(long, env = "DEPLOYER_SECRET")]
+        deployer_secret: String,
+
+        /// Write the resulting contract ID to a local .env file
+        #[arg(long, default_value = ".env")]
+        env_file: std::path::PathBuf,
     },
 }
 
@@ -230,21 +213,110 @@ fn main() -> Result<()> {
         Commands::List { contract_id, payer } => {
             list_escrows(&cli.rpc_url, &cli.network_passphrase, &contract_id, &payer, as_json)?;
         }
-        Commands::Setup => {
-            run_setup_wizard()?;
-        }
-        Commands::Export { contract_id, output: out_path } => {
-            run_export(&cli.rpc_url, &cli.network_passphrase, &contract_id, &out_path)?;
-        }
-        Commands::Completion { shell } => {
-            let mut cmd = Cli::command();
-            generate(shell, &mut cmd, "star-escrow", &mut io::stdout());
-        }
-        Commands::EstimateFee { contract_id, operation, source_secret } => {
-            run_estimate_fee(&cli.rpc_url, &cli.network_passphrase, &contract_id, &operation, &source_secret)?;
+
+        Commands::Deploy { wasm, deployer_secret, env_file } => {
+            deploy_contract(&cli.rpc_url, &cli.network_passphrase, wasm.as_deref(), &deployer_secret, &env_file, as_json)?;
         }
     }
 
+    Ok(())
+}
+
+/// Build (if needed) and deploy the contract; print and optionally persist the contract ID.
+fn deploy_contract(
+    rpc_url: &str,
+    network_passphrase: &str,
+    wasm: Option<&std::path::Path>,
+    deployer_secret: &str,
+    env_file: &std::path::Path,
+    as_json: bool,
+) -> Result<()> {
+    // Step 1: resolve WASM path, building if not provided.
+    let wasm_path = match wasm {
+        Some(p) => p.to_path_buf(),
+        None => {
+            eprintln!("No --wasm provided; running `stellar contract build`…");
+            let status = std::process::Command::new("stellar")
+                .args(["contract", "build"])
+                .status()
+                .context("stellar CLI not found — install from https://developers.stellar.org/docs/tools/developer-tools/cli/install-cli")?;
+            if !status.success() {
+                anyhow::bail!("`stellar contract build` failed");
+            }
+            std::path::PathBuf::from("target/wasm32-unknown-unknown/release/escrow.wasm")
+        }
+    };
+
+    if !wasm_path.exists() {
+        anyhow::bail!("WASM file not found: {}", wasm_path.display());
+    }
+
+    // Step 2: deploy.
+    let out = std::process::Command::new("stellar")
+        .args([
+            "contract", "deploy",
+            "--wasm", wasm_path.to_str().context("invalid wasm path")?,
+            "--source", deployer_secret,
+            "--rpc-url", rpc_url,
+            "--network-passphrase", network_passphrase,
+        ])
+        .output()
+        .context("stellar CLI not found")?;
+
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!("Deployment failed: {stderr}");
+    }
+
+    let contract_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if contract_id.is_empty() {
+        anyhow::bail!("Deployment succeeded but no contract ID was returned");
+    }
+
+    // Step 3: write to .env file.
+    upsert_env_var(env_file, "ESCROW_CONTRACT_ID", &contract_id)?;
+
+    output(
+        as_json,
+        serde_json::json!({"status": "ok", "contract_id": contract_id, "env_file": env_file.display().to_string()}),
+        &format!("Deployed! Contract ID: {contract_id}\nWritten to {}", env_file.display()),
+    );
+    Ok(())
+}
+
+/// Insert or update a KEY=VALUE line in a .env file.
+fn upsert_env_var(path: &std::path::Path, key: &str, value: &str) -> Result<()> {
+    use std::io::Write as _;
+
+    let existing = if path.exists() {
+        std::fs::read_to_string(path).context("reading .env file")?
+    } else {
+        String::new()
+    };
+
+    let prefix = format!("{key}=");
+    let new_line = format!("{key}={value}");
+    let mut found = false;
+    let updated: String = existing
+        .lines()
+        .map(|line| {
+            if line.starts_with(&prefix) {
+                found = true;
+                new_line.clone()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut content = if found { updated } else { format!("{existing}\n{new_line}") };
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+
+    let mut file = std::fs::File::create(path).context("writing .env file")?;
+    file.write_all(content.as_bytes()).context("writing .env file")?;
     Ok(())
 }
 
