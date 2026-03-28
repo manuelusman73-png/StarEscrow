@@ -41,3 +41,14 @@ These thresholds are conservative starting points. Tighten them after establishi
 - Measurements use `soroban_sdk::testutils::budget::Budget` in the test environment.
 - CPU instructions and memory are reset before each function call so only that function's cost is captured.
 - Yield protocol interactions are not included in the base benchmarks above.
+
+## WASM Size
+
+`wasm-opt -Oz` is applied in CI after `cargo build --release`. The optimized artifact is uploaded as `escrow-optimized-wasm`.
+
+| Stage              | Size      |
+|--------------------|-----------|
+| Before `wasm-opt`  | TBD       |
+| After `wasm-opt`   | TBD       |
+
+CI enforces a **100 KB** hard limit on the optimized WASM. Update this table after the first successful CI run.

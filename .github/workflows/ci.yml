@@ -38,21 +38,33 @@ jobs:
           path: bench-results.txt
 
       - name: Build WASM
-        run: |
-          cargo install --locked stellar-cli --features opt 2>/dev/null || true
-          cargo build -p escrow --target wasm32-unknown-unknown --release
+        run: cargo build -p escrow --target wasm32-unknown-unknown --release
 
-      - name: Report WASM size
+      - name: Install wasm-opt
+        run: |
+          curl -sSL https://github.com/WebAssembly/binaryen/releases/download/version_116/binaryen-version_116-x86_64-linux.tar.gz \
+            | tar -xz --strip-components=2 -C /usr/local/bin binaryen-version_116/bin/wasm-opt
+
+      - name: Optimize WASM with wasm-opt
         run: |
           WASM=target/wasm32-unknown-unknown/release/escrow.wasm
-          if [ -f "$WASM" ]; then
-            SIZE=$(wc -c < "$WASM")
-            echo "WASM size: ${SIZE} bytes"
-            echo "wasm_size=${SIZE}" >> "$GITHUB_OUTPUT"
-            # Regression check: fail if WASM exceeds 100 KB
-            if [ "$SIZE" -gt 102400 ]; then
-              echo "::error::WASM size ${SIZE} bytes exceeds 100 KB limit"
-              exit 1
-            fi
+          WASM_OPT=target/wasm32-unknown-unknown/release/escrow.optimized.wasm
+          SIZE_BEFORE=$(wc -c < "$WASM")
+          wasm-opt -Oz --strip-debug "$WASM" -o "$WASM_OPT"
+          SIZE_AFTER=$(wc -c < "$WASM_OPT")
+          echo "WASM size before wasm-opt: ${SIZE_BEFORE} bytes"
+          echo "WASM size after  wasm-opt: ${SIZE_AFTER} bytes"
+          echo "wasm_size_before=${SIZE_BEFORE}" >> "$GITHUB_OUTPUT"
+          echo "wasm_size_after=${SIZE_AFTER}"  >> "$GITHUB_OUTPUT"
+          # Regression check: fail if optimized WASM exceeds 100 KB
+          if [ "$SIZE_AFTER" -gt 102400 ]; then
+            echo "::error::Optimized WASM size ${SIZE_AFTER} bytes exceeds 100 KB limit"
+            exit 1
           fi
         id: wasm_size
+
+      - name: Upload optimized WASM
+        uses: actions/upload-artifact@v4
+        with:
+          name: escrow-optimized-wasm
+          path: target/wasm32-unknown-unknown/release/escrow.optimized.wasm
