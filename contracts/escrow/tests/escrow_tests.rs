@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use escrow::{EscrowContract, EscrowContractClient, EscrowError, EscrowStatus, YieldRecipient};
+use escrow::{EscrowContract, EscrowContractClient, EscrowError, EscrowStatus, YieldRecipient, storage::{Milestone, MilestoneStatus}};
 use soroban_sdk::{
     testutils::Ledger as _,
     token::{Client as TokenClient, StellarAssetClient},
@@ -15,6 +15,20 @@ fn create_token<'a>(env: &Env, admin: &Address) -> (TokenClient<'a>, StellarAsse
     )
 }
 
+fn test_address(name: &str) -> Address {
+    let env = Env::default();
+    // Create a deterministic address from a string by using it as a seed
+    // This is a workaround for testing purposes
+    let bytes = name.as_bytes();
+    let mut addr_bytes = [0u8; 32];
+    for (i, &byte) in bytes.iter().enumerate().take(32) {
+        addr_bytes[i] = byte;
+    }
+    // Use from_string_bytes instead of from_bytes
+    let strkey = String::from_str(&env, name);
+    Address::from_string(&strkey)
+}
+
 struct Setup<'a> {
     env: Env,
     payer: Address,
@@ -22,7 +36,6 @@ struct Setup<'a> {
     token: TokenClient<'a>,
     token_addr: Address,
     contract: EscrowContractClient<'a>,
-    rep: ReputationContractClient<'a>,
 }
 
 impl<'a> Setup<'a> {
@@ -30,10 +43,10 @@ impl<'a> Setup<'a> {
         let env = Env::default();
         env.mock_all_auths();
 
-        let payer = Address::generate(&env);
-        let freelancer = Address::generate(&env);
-        let admin = Address::generate(&env);
-        let fee_collector = Address::generate(&env);
+        let payer = test_address("payer");
+        let freelancer = test_address("freelancer");
+        let admin = test_address("admin");
+        let fee_collector = test_address("fee_collector");
 
         let (token, token_admin) = create_token(&env, &admin);
         let token_addr = token.address.clone();
@@ -42,36 +55,33 @@ impl<'a> Setup<'a> {
 
         let contract_addr = env.register_contract(None, EscrowContract);
         let contract = EscrowContractClient::new(&env, &contract_addr);
-        contract.init(&admin, &fee_bps, &fee_collector);
+        contract.init(&admin, &0u32, &fee_collector);  // fee_bps = 0 for default tests
 
-        Setup { env, payer, freelancer, token, token_addr, contract, rep }
+        Setup { env, payer, freelancer, token, token_addr, contract }
+    }
+
+    fn with_fee(fee_bps: u32) -> Self {
+        let mut s = Self::new();
+        // Re-init with fee (hack for test)
+        s.contract.init(&Address::generate(&s.env), &fee_bps, &Address::generate(&s.env));
+        s
     }
 
     fn simple_create(&self, amount: i128, milestone: &str) {
-        let m = String::from_str(&self.env, milestone);
+        let m = storage::Milestone {
+            description: String::from_str(&self.env, milestone),
+            amount,
+            status: storage::MilestoneStatus::Pending,
+        };
+        let milestones = vec![&self.env, m];
         self.contract.create(
             &self.payer,
             &self.freelancer,
             &self.token_addr,
-            &amount,
-            &m,
+            milestones,
             &None,
             &None,
-            &YieldRecipient::Payer,
-        );
-    }
-
-    fn simple_create(&self, amount: i128, milestone: &str) {
-        let m = String::from_str(&self.env, milestone);
-        self.contract.create(
-            &self.payer,
-            &self.freelancer,
-            &self.token_addr,
-            &amount,
-            &m,
-            &None,
-            &None,
-            &YieldRecipient::Payer,
+            &storage::YieldRecipient::Payer,
             &0u64,
             &0u32,
         );
@@ -88,8 +98,8 @@ fn test_full_happy_path() {
     assert_eq!(s.token.balance(&s.payer), 9500);
     assert_eq!(s.token.balance(&s.contract.address), 500);
 
-    s.contract.submit_work();
-    s.contract.approve();
+    s.contract.submit_work(0);
+    s.contract.approve(0);
     assert_eq!(s.token.balance(&s.freelancer), 500);
 }
 
@@ -105,12 +115,12 @@ fn test_cancel_refunds_payer() {
 fn test_approve_before_submit_fails() {
     let s = Setup::new();
     s.simple_create(100, "Approve before submit");
-    let err = s.contract.try_approve().unwrap_err().unwrap();
-    assert_eq!(err, EscrowError::WorkNotSubmitted);
+    let err = s.contract.try_approve(&0u32).unwrap_err().unwrap();
+    assert_eq!(err, EscrowError::MilestoneNotSubmitted);
 }
 
 #[test]
-fn test_approve_before_submit_fails() {
+fn test_cancel_after_submit_fails() {
     let s = Setup::new();
     s.simple_create(200, "Write tests");
     s.contract.submit_work();
@@ -176,7 +186,7 @@ fn test_get_status_expired() {
 #[test]
 fn test_transfer_freelancer_and_submit_work() {
     let s = Setup::new();
-    let new_freelancer = Address::generate(&s.env);
+    let new_freelancer = test_address("new_freelancer");
     s.simple_create(400, "Subcontract work");
     s.contract.transfer_freelancer(&new_freelancer);
     s.contract.submit_work();
@@ -206,7 +216,7 @@ fn test_unpause_restores_operations() {
 
 #[test]
 fn test_fee_deducted_on_approve() {
-    let s = Setup::with_fee(100); // 1%
+    let s = Setup::new_with_fee(100); // 1%
     s.simple_create(500, "Fee test");
     s.contract.submit_work();
     s.contract.approve();
@@ -405,7 +415,7 @@ fn test_ttl_extended_after_create() {
     let s = Setup::new();
     let milestone = String::from_str(&s.env, "TTL test");
 
-    s.contract.create(&s.payer, &s.freelancer, &s.token_addr, &100, &milestone, &None);
+    s.contract.create(&s.payer, &s.freelancer, &s.token_addr, &100, &milestone, &None, &None, &YieldRecipient::Payer, &0u64, &0u32);
 
     // After create the instance TTL should be extended; verify storage is still accessible.
     assert_eq!(s.contract.get_status(), escrow::EscrowStatus::Active);
@@ -416,7 +426,7 @@ fn test_ttl_extended_after_submit_work() {
     let s = Setup::new();
     let milestone = String::from_str(&s.env, "TTL submit");
 
-    s.contract.create(&s.payer, &s.freelancer, &s.token_addr, &100, &milestone, &None);
+    s.contract.create(&s.payer, &s.freelancer, &s.token_addr, &100, &milestone, &None, &None, &YieldRecipient::Payer, &0u64, &0u32);
     s.contract.submit_work();
 
     assert_eq!(s.contract.get_status(), escrow::EscrowStatus::WorkSubmitted);
@@ -427,7 +437,7 @@ fn test_ttl_extended_after_approve() {
     let s = Setup::new();
     let milestone = String::from_str(&s.env, "TTL approve");
 
-    s.contract.create(&s.payer, &s.freelancer, &s.token_addr, &100, &milestone, &None);
+    s.contract.create(&s.payer, &s.freelancer, &s.token_addr, &100, &milestone, &None, &None, &YieldRecipient::Payer, &0u64, &0u32);
     s.contract.submit_work();
     s.contract.approve();
 
@@ -439,7 +449,7 @@ fn test_ttl_extended_after_cancel() {
     let s = Setup::new();
     let milestone = String::from_str(&s.env, "TTL cancel");
 
-    s.contract.create(&s.payer, &s.freelancer, &s.token_addr, &100, &milestone, &None);
+    s.contract.create(&s.payer, &s.freelancer, &s.token_addr, &100, &milestone, &None, &None, &YieldRecipient::Payer, &0u64, &0u32);
     s.contract.cancel();
 
     assert_eq!(s.contract.get_status(), escrow::EscrowStatus::Cancelled);

@@ -261,6 +261,7 @@ dependencies = [
  "clap_complete",
  "dialoguer",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
